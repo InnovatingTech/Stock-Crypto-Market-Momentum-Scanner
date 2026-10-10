@@ -56,7 +56,12 @@ export async function fetchGoogleNews(query: string): Promise<SymbolNews & { kin
   // so a generic market story is never presented as this asset's reason.
   const subjects = trimmed.split(/\s+/).filter((token) => !/^(stock|stocks|crypto|share|shares)$/i.test(token));
   const mentionsSubject = (title: string) => subjects.some((token) => new RegExp(`(^|[^A-Za-z0-9])${token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^A-Za-z0-9]|$)`, "i").test(title));
-  const onSubject = recent.filter((item) => mentionsSubject(item.title));
+  // Short tickers (JZ, AI, GO…) collide with ordinary words and names, so a
+  // headline must also read as market coverage before it counts as a reason.
+  const shortSubject = subjects.every((token) => token.length <= 2);
+  const marketContext = /\b(stock|shares?|nasdaq|nyse|earnings|ipo|merger|acquisition|sec\b|trading|investors?|crypto|token|coin|price target|halt)\b/i;
+  const relevant = (title: string) => mentionsSubject(title) && (!shortSubject || marketContext.test(title));
+  const onSubject = recent.filter((item) => relevant(item.title));
   const informative = onSubject.filter((item) => !isRoundupHeadline(item.title));
   // Prefer a headline that classifies into a concrete reason category.
   const classified = informative.find((item) => classifyHeadline(item.title) !== null);

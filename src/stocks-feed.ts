@@ -23,6 +23,7 @@ export interface StocksResponse {
   quotes: StockQuotePayload[];
   fetchedAt: number;
   screens: string[];
+  source?: "yahoo-finance" | "nasdaq";
 }
 
 export type StocksStatus = "loading" | "live" | "error";
@@ -61,7 +62,7 @@ export class StocksFeed {
   private delay = POLL_MS;
 
   constructor(
-    private readonly onQuotes: (quotes: StockQuotePayload[], fetchedAt: number) => void,
+    private readonly onQuotes: (quotes: StockQuotePayload[], fetchedAt: number, source: "yahoo-finance" | "nasdaq") => void,
     private readonly onStatus: (status: StocksStatus, detail?: string) => void
   ) {}
 
@@ -83,7 +84,7 @@ export class StocksFeed {
       if (!response.ok) throw new Error(`Stock source responded ${response.status}`);
       const payload = await response.json() as StocksResponse;
       if (!Array.isArray(payload.quotes)) throw new Error("Stock source returned an unexpected shape");
-      this.onQuotes(payload.quotes, payload.fetchedAt ?? Date.now());
+      this.onQuotes(payload.quotes, payload.fetchedAt ?? Date.now(), payload.source === "nasdaq" ? "nasdaq" : "yahoo-finance");
       this.onStatus("live");
       this.delay = POLL_MS;
     } catch (error) {

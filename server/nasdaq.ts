@@ -22,6 +22,38 @@ function parseNumber(value: string | undefined): number | null {
   return Number.isFinite(cleaned) ? cleaned : null;
 }
 
+/** Current US equity session phase derived from the New York clock. */
+export function usMarketState(now = new Date()): "PRE" | "REGULAR" | "POST" | "CLOSED" {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "America/New_York",
+    hour: "2-digit",
+    minute: "2-digit",
+    weekday: "short",
+    hour12: false
+  }).formatToParts(now);
+  const get = (type: string) => parts.find((part) => part.type === type)?.value ?? "";
+  const weekday = get("weekday");
+  if (weekday === "Sat" || weekday === "Sun") return "CLOSED";
+  const minutes = Number(get("hour")) * 60 + Number(get("minute"));
+  if (minutes >= 240 && minutes < 570) return "PRE";
+  if (minutes >= 570 && minutes < 960) return "REGULAR";
+  if (minutes >= 960 && minutes < 1200) return "POST";
+  return "CLOSED";
+}
+
+/**
+ * Nasdaq's chart and screener stamp Eastern wall-clock values as if they were
+ * UTC. This returns the correction (in ms) to recover the true instant.
+ */
+function easternStampCorrectionMs(stampedUtc: number): number {
+  const label = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", timeZoneName: "shortOffset" })
+    .formatToParts(new Date(stampedUtc))
+    .find((part) => part.type === "timeZoneName")?.value ?? "GMT-5";
+  const match = label.match(/GMT([+-]\d+)/);
+  const offsetHours = match ? Number(match[1]) : -5;
+  return -offsetHours * 3_600_000;
+}
+
 function parsePercent(value: string | undefined): number | null {
   if (typeof value !== "string" || !/^-?[\d,]+(\.\d+)?%$/.test(value.trim())) return null;
   const percent = parseNumber(value);
@@ -44,6 +76,7 @@ export async function fetchNasdaqStocks(): Promise<StocksPayload> {
   const payload = await response.json() as { data?: { rows?: NasdaqRow[] } };
   const rows = payload.data?.rows ?? [];
   const now = Date.now();
+  const marketState = usMarketState();
   const quotes: StockQuote[] = [];
   for (const row of rows) {
     const symbol = typeof row.symbol === "string" ? row.symbol.trim().toUpperCase() : "";
@@ -63,7 +96,9 @@ export async function fetchNasdaqStocks(): Promise<StocksPayload> {
       sharesOutstandingMillions: marketCap !== null && marketCap > 0 ? marketCap / price / 1_000_000 : null,
       marketCapMillions: marketCap !== null ? marketCap / 1_000_000 : null,
       exchange: "US",
-      marketState: "REGULAR",
+      // Honest session state: off-hours screener rows must never be
+      // presented as live quotes.
+      marketState,
       delayMinutes: 0,
       sourceTime: now,
       quoteSource: "Nasdaq screener"
@@ -123,11 +158,12 @@ export async function fetchNasdaqCandles(symbol: string): Promise<CandlePayload>
   const points = (payload.data?.chart ?? []).filter((point): point is { x: number; y: number } =>
     typeof point.x === "number" && typeof point.y === "number" && Number.isFinite(point.y) && point.y > 0);
   const candles: CandlePayload["candles"] = [];
+  const stampCorrection = points.length ? easternStampCorrectionMs(points[points.length - 1].x) : 0;
   for (let index = 1; index < points.length; index += 1) {
     const open = points[index - 1].y;
     const close = points[index].y;
     candles.push({
-      time: points[index].x,
+      time: points[index].x + stampCorrection,
       open,
       close,
       high: Math.max(open, close),

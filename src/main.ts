@@ -8,7 +8,11 @@ import { calculatePlan, defaultFilters, matchesFilters, scoreCandidate } from ".
 import { fetchCandles, mapStockQuote, StocksFeed, type StocksStatus } from "./stocks-feed";
 import { JournalStore } from "./storage";
 import { renderDayChart } from "./chart";
+import { computeActivityRatio } from "./crypto-activity";
+import { coachState, dayProgress, entryPnl, greenWeeks, journalStats, resolvedEntries, worstHour } from "./journal-stats";
+import { parseExportedData, STORAGE_KEYS } from "./storage";
 import { analysePullback, type Candle, type PullbackResult } from "./technical";
+import { momentRank, verdictFor, type MomentVerdict, type Tick } from "./verdicts";
 import type { AssetClass, Candidate, Filters, JournalEntry } from "./types";
 
 type View = "discover" | "plan" | "journal" | "how";
@@ -93,11 +97,6 @@ function newYorkSession(now = new Date()): SessionInfo {
   };
 }
 
-interface Tick {
-  label: string;
-  detail: string;
-  state: "pass" | "fail" | "unknown";
-}
 
 class App {
   private assetClass: AssetClass = "stocks";
@@ -112,6 +111,7 @@ class App {
   private stocksFeed?: StocksFeed;
   private stocksStatus: StocksStatus = "loading";
   private stocksDetail = "";
+  private stocksSource: "yahoo-finance" | "nasdaq" = "yahoo-finance";
   private stockCandidates: Candidate[] = [];
 
   private feed?: BinanceFeed;
@@ -156,7 +156,8 @@ class App {
 
   private startStocks() {
     this.stocksFeed = new StocksFeed(
-      (quotes) => {
+      (quotes, _fetchedAt, source) => {
+        this.stocksSource = source;
         const receiptTime = Date.now();
         this.stockCandidates = quotes.map((quote) => {
           const base = mapStockQuote(quote, receiptTime);
@@ -339,16 +340,9 @@ class App {
     }
   }
 
-  private cryptoActivityRatio(candidate: Candidate): { ratio: number; windowHours: number } | undefined {
+  private cryptoActivityRatio(candidate: Candidate) {
     const base = this.cryptoActivityBase.get(candidate.symbol);
-    if (!base) return undefined;
-    const windowHours = this.prefs.cryptoActivityWindowHours;
-    if (windowHours === 24) {
-      return candidate.volume > 0 ? { ratio: candidate.volume / base.avgDailyQuote, windowHours } : undefined;
-    }
-    const recent = base.hourlyQuote.slice(-windowHours).reduce((sum, value) => sum + value, 0);
-    const expected = (base.avgDailyQuote / 24) * windowHours;
-    return expected > 0 ? { ratio: recent / expected, windowHours } : undefined;
+    return base ? computeActivityRatio(base, this.prefs.cryptoActivityWindowHours, candidate.volume) : undefined;
   }
 
   private applyCryptoDetails(candidates: Candidate[]) {
@@ -451,25 +445,13 @@ class App {
 
   /* ---------- Verdicts ---------- */
 
-  private momentVerdict(candidate: Candidate): "entry" | "wait" | "avoid" | undefined {
+  private momentVerdict(candidate: Candidate): MomentVerdict {
     const record = this.pullbacks.get(candidate.symbol);
     return record?.result.ready ? record.result.verdict : undefined;
   }
 
   private overallVerdict(candidate: Candidate, ticks: Tick[]) {
-    const passes = ticks.filter((tick) => tick.state === "pass").length;
-    const fails = ticks.filter((tick) => tick.state === "fail").length;
-    // Unknown ticks are neutral: a coin missing a data point is not a coin
-    // that failed a check. Strong = mostly passing with at most one failure.
-    const strong = passes >= 3 && fails <= 1;
-    const weak = fails >= 3 || passes <= 1;
-    const moment = this.momentVerdict(candidate);
-    if (weak) return { cls: "skip", label: this.simple ? "Skip this one" : "Skip · weak quality", passes };
-    if (!strong) return { cls: "mid", label: this.simple ? "Borderline — be careful" : "Borderline", passes };
-    if (moment === "entry") return { cls: "go", label: this.simple ? "✓ Good moment to trade" : "Entry signal", passes };
-    if (moment === "wait") return { cls: "hold", label: this.simple ? "Wait — not yet" : "Wait · pattern forming", passes };
-    if (moment === "avoid") return { cls: "off", label: this.simple ? "Too late — move has faded" : "No trade · pattern failed", passes };
-    return { cls: "strong", label: this.simple ? "Good quality — checking timing…" : "Quality passes · timing unchecked", passes };
+    return verdictFor(ticks, this.momentVerdict(candidate), this.simple);
   }
 
   private companyTip(candidate: Candidate) {
@@ -516,12 +498,8 @@ class App {
   private rankedCandidates(assetClass: AssetClass = this.assetClass) {
     const source = assetClass === "stocks" ? this.stockCandidates : this.cryptoCandidates;
     // Buyable-now candidates first, then strong-but-waiting, then the rest.
-    const momentRank = (candidate: Candidate) => {
-      const verdict = this.momentVerdict(candidate);
-      return verdict === "entry" ? 0 : verdict === "wait" ? 1 : verdict === undefined ? 2 : 3;
-    };
     return [...source].sort((a, b) =>
-      momentRank(a) - momentRank(b) || b.score - a.score || b.changePercent - a.changePercent);
+      momentRank(this.momentVerdict(a)) - momentRank(this.momentVerdict(b)) || b.score - a.score || b.changePercent - a.changePercent);
   }
 
   private ticksFor(candidate: Candidate): Tick[] {
@@ -535,10 +513,10 @@ class App {
       const sharesOk = sharesKnown && (candidate.floatOrMarketCap as number) <= filters.maxFloatMillions;
       const catalystChecked = candidate.catalystState === "confirmed" || candidate.catalystState === "no-evidence";
       return [
-        { label: this.simple ? "Up a lot today" : `Gain ≥ ${filters.minChange}%`, detail: `${this.percent(candidate.changePercent)} so far`, state: gainOk ? "pass" : "fail" },
-        { label: this.simple ? "Much busier than normal" : `Relative volume ≥ ${filters.minRelativeVolume}×`, detail: rvolKnown ? `${candidate.relativeVolume.toFixed(1)}× its usual trading` : "Usual volume unknown", state: !rvolKnown ? "unknown" : rvolOk ? "pass" : "fail" },
-        { label: this.simple ? "In your price range" : `Price $${filters.minPrice}–$${filters.maxPrice}`, detail: this.money(candidate.price), state: priceOk ? "pass" : "fail" },
-        { label: this.simple ? "Only a small number of shares exist" : `Shares in issue ≤ ${filters.maxFloatMillions}m`, detail: sharesKnown ? `${(candidate.floatOrMarketCap as number).toFixed(0)}m shares in issue` : "Share count unknown", state: !sharesKnown ? "unknown" : sharesOk ? "pass" : "fail" },
+        { key: "gain" as const, label: this.simple ? "Up a lot today" : `Gain ≥ ${filters.minChange}%`, detail: `${this.percent(candidate.changePercent)} so far`, state: gainOk ? "pass" as const : "fail" as const },
+        { key: "rvol" as const, label: this.simple ? "Much busier than normal" : `Relative volume ≥ ${filters.minRelativeVolume}×`, detail: rvolKnown ? `${candidate.relativeVolume.toFixed(1)}× its usual trading` : "Usual volume unknown", state: !rvolKnown ? "unknown" as const : rvolOk ? "pass" as const : "fail" as const },
+        { key: "price" as const, label: this.simple ? "In your price range" : `Price $${filters.minPrice}–$${filters.maxPrice}`, detail: this.money(candidate.price), state: priceOk ? "pass" as const : "fail" as const },
+        { key: "shares" as const, label: this.simple ? "Only a small number of shares exist" : `Shares in issue ≤ ${filters.maxFloatMillions}m`, detail: sharesKnown ? `${(candidate.floatOrMarketCap as number).toFixed(0)}m shares in issue` : "Share count unknown", state: !sharesKnown ? "unknown" as const : sharesOk ? "pass" as const : "fail" as const },
         this.catalystTick(candidate, catalystChecked)
       ];
     }
@@ -546,30 +524,31 @@ class App {
   }
 
   private catalystTick(candidate: Candidate, catalystChecked: boolean): Tick {
+    const key = "catalyst" as const;
     const label = this.simple ? "Clear reason for the move" : "Catalyst";
     if (candidate.catalystState === "confirmed") {
       const evidence = candidate.catalystEvidence?.[0];
       const what = evidence?.title ? this.truncate(evidence.title, 72) : "official filing or trading halt";
-      return { label, detail: `Official: ${what}`, state: "pass" };
+      return { key, label, detail: `Official: ${what}`, state: "pass" };
     }
     const news = candidate.catalystNews;
     if (news) {
       if (news.kind === "Market roundup") {
-        return { label, detail: this.simple ? "No headline names it directly — only broad market coverage found" : "No subject-specific headline; broad coverage only", state: "unknown" };
+        return { key, label, detail: this.simple ? "No headline names it directly — only broad market coverage found" : "No subject-specific headline; broad coverage only", state: "unknown" };
       }
       const headline = news.title ? `“${this.truncate(news.title, 84)}”` : `${news.count} recent stories`;
       const prefix = news.kind ?? "In the news";
-      return { label, detail: `${prefix} — ${headline}`, state: "pass" };
+      return { key, label, detail: `${prefix} — ${headline}`, state: "pass" };
     }
     if (candidate.assetClass === "crypto") {
       const cached = this.cryptoNews.get(candidate.symbol);
       if (cached && cached.news === null) {
-        return { label, detail: this.simple ? "No clear news found — crypto spikes often start on social media before the press" : "No recent headlines found", state: "unknown" };
+        return { key, label, detail: this.simple ? "No clear news found — crypto spikes often start on social media before the press" : "No recent headlines found", state: "unknown" };
       }
-      return { label, detail: "Checking the news…", state: "unknown" };
+      return { key, label, detail: "Checking the news…", state: "unknown" };
     }
-    if (!catalystChecked) return { label, detail: "Not checked yet", state: "unknown" };
-    return { label, detail: "No official news or headlines found", state: "fail" };
+    if (!catalystChecked) return { key, label, detail: "Not checked yet", state: "unknown" };
+    return { key, label, detail: "No official news or headlines found", state: "fail" };
   }
 
   private truncate(value: string, length: number) {
@@ -655,7 +634,8 @@ class App {
 
   private feedStatusLine(): { live: boolean; text: string } {
     if (this.assetClass === "stocks") {
-      if (this.stocksStatus === "live") return { live: true, text: this.simple ? "Share prices are flowing" : "Live · US gainers via Yahoo Finance" };
+      const sourceLabel = this.stocksSource === "nasdaq" ? "US movers via Nasdaq" : "US gainers via Yahoo Finance";
+      if (this.stocksStatus === "live") return { live: true, text: this.simple ? "Share prices are flowing" : `Live · ${sourceLabel}` };
       if (this.stocksStatus === "loading") return { live: false, text: "Loading share prices…" };
       return { live: false, text: this.simple ? "Share prices are unavailable right now" : `Stock source error: ${this.stocksDetail}` };
     }
@@ -732,7 +712,9 @@ class App {
     const lede = this.assetClass === "stocks"
       ? this.simple
         ? "These are today's fastest-rising US shares, best first. The ticks show how well each one fits the strategy."
-        : "Merged Yahoo Finance gainer screens, scored against the five pillars. Relative volume uses the 3-month average; share count stands in for float."
+        : this.stocksSource === "nasdaq"
+          ? "Nasdaq's full-market screener, scored against the five pillars. Average volume and sector come from Nasdaq quote summaries; share count stands in for float."
+          : "Merged Yahoo Finance gainer screens, scored against the five pillars. Relative volume uses the 3-month average; share count stands in for float."
       : this.simple
         ? "The busiest coins on Binance right now, best first. Prices are checked against Coinbase where possible."
         : "Binance whole-market discovery with 5m/1h momentum, activity versus recent norm, visible depth and a Coinbase price check.";
@@ -796,7 +778,7 @@ class App {
   private renderEmpty() {
     if (this.assetClass === "stocks") {
       if (this.stocksStatus === "error") {
-        return `<div class="empty-state"><strong>Share prices are unavailable right now.</strong><span>The data source did not respond. It usually recovers on its own — the app retries every 30 seconds.</span></div>`;
+        return `<div class="empty-state"><strong>Share prices are unavailable right now.</strong><span>The data source did not respond. It usually recovers on its own — the app retries automatically, backing off when the source stays quiet.</span></div>`;
       }
       return `<div class="empty-state"><strong>Loading today's movers…</strong><span>This normally takes a second or two.</span></div>`;
     }
@@ -892,7 +874,11 @@ class App {
   private dataBadge(row: Candidate) {
     if (row.assetClass === "crypto") return row.crossVenue ? "Live · 2 venues" : "Live · Binance";
     if (row.coverage === "delayed") return row.dataMode ?? "Delayed";
-    return row.marketState === "REGULAR" ? "Live" : `Live · ${(row.marketState ?? "").toLowerCase().replace(/^\w/, (c) => c.toUpperCase()) || "off-hours"}`;
+    if (row.marketState === "REGULAR") return "Live";
+    if (row.marketState === "PRE") return "Pre-market";
+    if (row.marketState === "POST" || row.marketState === "POSTPOST") return "After hours";
+    if (row.marketState === "CLOSED") return "Market closed · last session";
+    return `Off-hours · ${(row.marketState ?? "unknown").toLowerCase()}`;
   }
 
   private displaySymbol(row: Candidate) {
@@ -905,11 +891,12 @@ class App {
   private renderPlan() {
     const selected = this.selected;
     if (!selected) {
-      return `<div class="empty-state" style="margin-top:24px"><strong>${this.simple ? "Pick something from the movers list first." : "Select a candidate first."}</strong><span>${this.simple ? "Open “What's moving” and choose “Make a plan” on any card." : "Open Discover and choose Plan on any row."}</span><button class="secondary-button" data-goto="discover">${this.simple ? "See what's moving" : "Open Discover"}</button></div>`;
+      return `<div class="empty-state" style="margin-top:24px"><strong>${this.simple ? "Pick something from the movers list first." : "Select a candidate first."}</strong><span>${this.simple ? "Open “What's moving” and choose “Check & plan” on any card." : "Open Discover and choose Plan on any row."}</span><button class="secondary-button" data-goto="discover">${this.simple ? "See what's moving" : "Open Discover"}</button></div>`;
     }
     const ticks = this.ticksFor(selected);
     const passes = ticks.filter((tick) => tick.state === "pass").length;
-    const strong = passes >= 4;
+    const verdict = this.overallVerdict(selected, ticks);
+    const strong = verdict.cls !== "mid" && verdict.cls !== "skip";
     void this.ensurePullback(selected);
     const pullbackRecord = this.pullbacks.get(selected.symbol);
     const pullback = pullbackRecord?.result;
@@ -977,7 +964,7 @@ class App {
     } else if (moment === "entry") {
       action = this.simple
         ? `The moment looks right. In the simulator: buy near ${this.money(candidate.price)}, set your get-out at ${this.money(suggestedStop)}, and aim to sell around ${this.money(target)} — or get out early if it drops below your get-out price or a nasty rejection appears at the top.`
-        : `Entry signal active. Entry ≈ ${this.money(candidate.price)}, stop ${this.money(suggestedStop)}, 2R target ≈ ${this.money(target)}.`;
+        : `Plan levels: entry ${this.money(candidate.price)} · stop ${this.money(suggestedStop)} · target ${this.money(target)}.`;
     } else if (moment === "wait") {
       action = this.simple
         ? "Strong candidate, wrong moment. Don't buy yet — watch it, and only act when it stops falling and starts making new highs again (the check below will turn green)."
@@ -1038,46 +1025,31 @@ class App {
 
   /* ---------- Journal ---------- */
 
-  private resolvedEntries() {
-    return this.journal.filter((entry) => entry.outcome !== undefined);
-  }
-
-  private entryPnl(entry: JournalEntry) {
-    return (entry.outcome ?? 0) * entry.risk;
-  }
-
   private todayKey(date = new Date()) {
     return date.toISOString().slice(0, 10);
   }
 
-  private todaysResolved() {
-    const today = this.todayKey();
-    return this.resolvedEntries().filter((entry) => entry.createdAt.slice(0, 10) === today);
-  }
-
   private renderJournal() {
-    const resolved = this.resolvedEntries();
-    const wins = resolved.filter((entry) => (entry.outcome ?? 0) > 0);
-    const losses = resolved.filter((entry) => (entry.outcome ?? 0) <= 0);
-    const accuracy = resolved.length ? Math.round((wins.length / resolved.length) * 100) : 0;
-    const avgWin = wins.length ? wins.reduce((sum, entry) => sum + this.entryPnl(entry), 0) / wins.length : 0;
-    const avgLoss = losses.length ? Math.abs(losses.reduce((sum, entry) => sum + this.entryPnl(entry), 0) / losses.length) : 0;
-    const greenWeeks = this.greenWeeks();
+    const resolved = resolvedEntries(this.journal);
+    const stats = journalStats(this.journal);
+    const weeks = greenWeeks(this.journal);
     return `
       <div class="discover-head">
         <div><p class="eyebrow">${this.simple ? "Your coach" : "Process review"}</p><h1>${this.simple ? "How you're doing" : "Journal"}</h1><p class="lede">${this.simple ? "Every practice trade you save lands here, along with what the numbers say about your habits." : "Review decisions, not just outcomes."}</p></div>
         <div style="display:flex; gap:8px; flex-wrap:wrap">
           <button class="secondary-button" id="record-no-trade">${this.simple ? "Record a no-trade day" : "Log no-trade day"}</button>
-          <button class="secondary-button" id="export-journal" ${this.journal.length ? "" : "disabled"}>Export</button>
+          <button class="secondary-button" id="export-journal">${this.simple ? "Export my data" : "Export data"}</button>
+          <button class="secondary-button" id="import-journal">Import</button>
+          <input id="import-file" type="file" accept="application/json,.json" hidden>
         </div>
       </div>
       ${this.renderCoach()}
       <div class="metric-row">
-        <div class="metric"><span>${this.simple ? "Practice trades" : "Resolved trades"}</span><strong class="num">${resolved.length}</strong></div>
-        <div class="metric"><span>${this.simple ? "Times you were right" : "Accuracy"}</span><strong class="num">${resolved.length ? `${accuracy}%` : "—"}</strong></div>
-        <div class="metric"><span>${this.simple ? "Average win" : "Avg winner"}</span><strong class="num positive">${wins.length ? this.money(avgWin) : "—"}</strong></div>
-        <div class="metric"><span>${this.simple ? "Average loss" : "Avg loser"}</span><strong class="num negative">${losses.length ? this.money(avgLoss) : "—"}</strong></div>
-        <div class="metric"><span>${this.simple ? "Positive weeks (last 6)" : "Green weeks / 6"}</span><strong class="num">${greenWeeks.total ? `${greenWeeks.green} of ${greenWeeks.total}` : "—"}</strong></div>
+        <div class="metric"><span>${this.simple ? "Practice trades" : "Resolved trades"}</span><strong class="num">${stats.resolvedCount}</strong></div>
+        <div class="metric"><span>${this.simple ? "Times you were right" : "Accuracy"}</span><strong class="num">${stats.resolvedCount ? `${stats.accuracyPercent}%` : "—"}</strong></div>
+        <div class="metric"><span>${this.simple ? "Average win" : "Avg winner"}</span><strong class="num positive">${stats.winCount ? this.money(stats.averageWin) : "—"}</strong></div>
+        <div class="metric"><span>${this.simple ? "Average loss" : "Avg loser"}</span><strong class="num negative">${stats.lossCount ? this.money(stats.averageLoss) : "—"}</strong></div>
+        <div class="metric"><span>${this.simple ? "Positive weeks (last 6)" : "Green weeks / 6"}</span><strong class="num">${weeks.total ? `${weeks.green} of ${weeks.total}` : "—"}</strong></div>
       </div>
       ${this.renderDayChips()}
       ${this.renderInsights(resolved)}
@@ -1090,32 +1062,27 @@ class App {
   }
 
   private renderCoach() {
-    const today = this.todaysResolved().sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-    const pnl = today.reduce((sum, entry) => sum + this.entryPnl(entry), 0);
-    let running = 0;
-    let peak = 0;
-    for (const entry of today) {
-      running += this.entryPnl(entry);
-      peak = Math.max(peak, running);
-    }
-    const gaveBackHalf = peak > 0 && running <= peak / 2;
     const session = newYorkSession();
-    if (pnl <= -this.prefs.dailyLossLimit) {
-      return `<div class="coach-banner stop"><span class="coach-icon">✋</span><p><strong>You've reached your daily safety limit (${this.money(this.prefs.dailyLossLimit)}).</strong> ${this.simple ? "Today's practice is done — losses grow fastest when we chase them. See you tomorrow." : "Stop trading for the day; review the entries below instead."}</p></div>`;
+    const state = coachState({
+      progress: dayProgress(this.journal, this.todayKey()),
+      dailyLossLimit: this.prefs.dailyLossLimit,
+      marketOpenPastPrime: session.phase === "open" && !session.prime,
+      noTradeDayRecorded: this.noTradeDays.includes(this.todayKey())
+    });
+    switch (state.kind) {
+      case "limit":
+        return `<div class="coach-banner stop"><span class="coach-icon">✋</span><p><strong>You've reached your daily safety limit (${this.money(state.limit)}).</strong> ${this.simple ? "Today's practice is done — losses grow fastest when we chase them. See you tomorrow." : "Stop trading for the day; review the entries below instead."}</p></div>`;
+      case "half-back":
+        return `<div class="coach-banner warn"><span class="coach-icon">⚠️</span><p><strong>You've handed back half of today's gain.</strong> ${this.simple ? "This is usually the best moment to stop while the day is still positive." : `Peak was ${this.money(state.peak)}; now ${this.money(state.pnl)}. Historically the highest-risk moment to keep going.`}</p></div>`;
+      case "late":
+        return `<div class="coach-banner warn"><span class="coach-icon">🕙</span><p><strong>${this.simple ? "The liveliest part of the day is over." : "Past the prime window."}</strong> ${this.simple ? "Most momentum traders do their best work before 10am New York time. Trades from here on deserve extra caution." : "Momentum performance typically degrades after 10:00 ET."}</p></div>`;
+      case "no-trade":
+        return `<div class="coach-banner"><span class="coach-icon">💪</span><p><strong>No trade today — that took discipline.</strong> ${this.simple ? "Skipping a weak day protects your results more than any single win." : "A recorded no-trade day counts towards consistency."}</p></div>`;
+      case "positive":
+        return `<div class="coach-banner"><span class="coach-icon">✅</span><p><strong>Today is positive: ${this.money(state.pnl)}.</strong> ${this.simple ? "Protect it — if you give half of it back, stop." : `Half-back rule armed at ${this.money(state.pnl / 2)}.`}</p></div>`;
+      default:
+        return "";
     }
-    if (gaveBackHalf) {
-      return `<div class="coach-banner warn"><span class="coach-icon">⚠️</span><p><strong>You've handed back half of today's gain.</strong> ${this.simple ? "This is usually the best moment to stop while the day is still positive." : `Peak was ${this.money(peak)}; now ${this.money(running)}. Historically the highest-risk moment to keep going.`}</p></div>`;
-    }
-    if (session.phase === "open" && !session.prime && today.length) {
-      return `<div class="coach-banner warn"><span class="coach-icon">🕙</span><p><strong>${this.simple ? "The liveliest part of the day is over." : "Past the prime window."}</strong> ${this.simple ? "Most momentum traders do their best work before 10am New York time. Trades from here on deserve extra caution." : "Ross-style momentum performance typically degrades after 10:00 ET."}</p></div>`;
-    }
-    if (!today.length && this.noTradeDays.includes(this.todayKey())) {
-      return `<div class="coach-banner"><span class="coach-icon">💪</span><p><strong>No trade today — that took discipline.</strong> ${this.simple ? "Skipping a weak day protects your results more than any single win." : "A recorded no-trade day counts towards consistency."}</p></div>`;
-    }
-    if (pnl > 0) {
-      return `<div class="coach-banner"><span class="coach-icon">✅</span><p><strong>Today is positive: ${this.money(pnl)}.</strong> ${this.simple ? "Protect it — if you give half of it back, stop." : `Half-back rule armed at ${this.money(pnl / 2)}.`}</p></div>`;
-    }
-    return "";
   }
 
   private renderDayChips() {
@@ -1126,9 +1093,9 @@ class App {
       days.push(date.toISOString().slice(0, 10));
     }
     const byDay = new Map<string, number>();
-    for (const entry of this.resolvedEntries()) {
+    for (const entry of resolvedEntries(this.journal)) {
       const day = entry.createdAt.slice(0, 10);
-      byDay.set(day, (byDay.get(day) ?? 0) + this.entryPnl(entry));
+      byDay.set(day, (byDay.get(day) ?? 0) + entryPnl(entry));
     }
     return `<div class="day-chips" aria-label="${this.simple ? "Last 14 days" : "Daily results, last 14 days"}">${days.map((day) => {
       const pnl = byDay.get(day);
@@ -1141,23 +1108,11 @@ class App {
 
   private renderInsights(resolved: JournalEntry[]) {
     const insights: string[] = [];
-    const byHour = new Map<number, { pnl: number; count: number }>();
-    for (const entry of resolved) {
-      const hour = new Date(entry.createdAt).getHours();
-      const bucket = byHour.get(hour) ?? { pnl: 0, count: 0 };
-      bucket.pnl += this.entryPnl(entry);
-      bucket.count += 1;
-      byHour.set(hour, bucket);
-    }
-    let worst: { hour: number; pnl: number } | null = null;
-    byHour.forEach((bucket, hour) => {
-      if (bucket.count >= 3 && bucket.pnl < 0 && (!worst || bucket.pnl < worst.pnl)) worst = { hour, pnl: bucket.pnl };
-    });
-    if (worst !== null) {
-      const { hour, pnl } = worst as { hour: number; pnl: number };
+    const worst = worstHour(this.journal);
+    if (worst) {
       insights.push(this.simple
-        ? `Most of your losses happen around ${hour}:00. Consider stopping before then.`
-        : `Trades opened around ${hour}:00 have cost you ${this.money(Math.abs(pnl))} in total. Consider a cutoff.`);
+        ? `Most of your losses happen around ${worst.hour}:00. Consider stopping before then.`
+        : `Trades opened around ${worst.hour}:00 have cost you ${this.money(Math.abs(worst.totalLoss))} in total. Consider a cutoff.`);
     }
     const wins = resolved.filter((entry) => (entry.outcome ?? 0) > 0).length;
     if (resolved.length >= 10 && wins / resolved.length >= 0.5) {
@@ -1184,27 +1139,11 @@ class App {
       <div class="je-actions">
         ${outcome === undefined
           ? `<button class="text-button" data-outcome="${rMultiple.toFixed(2)}" data-entry-id="${entry.id}">${this.simple ? "It won" : "Win"}</button><button class="text-button danger" data-outcome="-1" data-entry-id="${entry.id}">${this.simple ? "It lost" : "Loss"}</button>`
-          : `<span class="outcome-chip ${outcome > 0 ? "win" : "loss"}">${outcome > 0 ? "+" : "−"}${this.money(Math.abs(this.entryPnl(entry)))}</span>`}
+          : `<span class="outcome-chip ${outcome > 0 ? "win" : "loss"}">${outcome > 0 ? "+" : "−"}${this.money(Math.abs(entryPnl(entry)))}</span>`}
         <button class="text-button ${this.pendingDeleteId === entry.id ? "danger" : ""}" data-delete-entry="${entry.id}">${this.pendingDeleteId === entry.id ? "Confirm delete" : "Delete"}</button>
       </div>
       ${entry.note ? `<p class="je-note">${this.escape(entry.note)}</p>` : ""}
     </article>`;
-  }
-
-  private greenWeeks() {
-    const resolved = this.resolvedEntries();
-    if (!resolved.length) return { green: 0, total: 0 };
-    const weekPnl = new Map<string, number>();
-    const now = Date.now();
-    for (const entry of resolved) {
-      const created = new Date(entry.createdAt).getTime();
-      const weeksAgo = Math.floor((now - created) / (7 * 24 * 3_600_000));
-      if (weeksAgo > 5) continue;
-      const key = String(weeksAgo);
-      weekPnl.set(key, (weekPnl.get(key) ?? 0) + this.entryPnl(entry));
-    }
-    const values = [...weekPnl.values()];
-    return { green: values.filter((value) => value > 0).length, total: values.length };
   }
 
   /* ---------- Events ---------- */
@@ -1233,7 +1172,14 @@ class App {
     this.bindFilters();
     this.root.querySelector<HTMLFormElement>("#plan-form")?.addEventListener("input", () => this.updatePlanSummary());
     this.root.querySelector<HTMLFormElement>("#plan-form")?.addEventListener("submit", (event) => this.savePlan(event));
-    this.root.querySelector<HTMLButtonElement>("#export-journal")?.addEventListener("click", () => this.journalStore.export(this.journal));
+    this.root.querySelector<HTMLButtonElement>("#export-journal")?.addEventListener("click", () =>
+      this.journalStore.export(this.journal, this.noTradeDays, this.prefs as unknown as Record<string, unknown>));
+    this.root.querySelector<HTMLButtonElement>("#import-journal")?.addEventListener("click", () =>
+      this.root.querySelector<HTMLInputElement>("#import-file")?.click());
+    this.root.querySelector<HTMLInputElement>("#import-file")?.addEventListener("change", (event) => {
+      const file = (event.currentTarget as HTMLInputElement).files?.[0];
+      if (file) void this.importData(file);
+    });
     this.root.querySelector<HTMLButtonElement>("#record-no-trade")?.addEventListener("click", () => {
       const today = this.todayKey();
       if (!this.noTradeDays.includes(today)) {
@@ -1270,6 +1216,26 @@ class App {
       this.render();
     }));
     this.updatePlanSummary();
+  }
+
+  private async importData(file: File) {
+    try {
+      const imported = parseExportedData(await file.text());
+      // Merge rather than replace: existing entries win on id collisions.
+      const known = new Set(this.journal.map((entry) => entry.id));
+      this.journal = [...this.journal, ...imported.journal.filter((entry) => !known.has(entry.id))]
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+      this.journalStore.save(this.journal);
+      this.noTradeDays = [...new Set([...this.noTradeDays, ...imported.noTradeDays])];
+      localStorage.setItem(NO_TRADE_KEY, JSON.stringify(this.noTradeDays));
+      if (imported.prefs) {
+        localStorage.setItem(STORAGE_KEYS.prefs, JSON.stringify({ ...this.prefs, ...imported.prefs }));
+        this.prefs = loadPrefs();
+      }
+      this.render();
+    } catch (error) {
+      window.alert(`Import failed: ${error instanceof Error ? error.message : "unreadable file"}`);
+    }
   }
 
   private bindCandidateActions() {
@@ -1359,7 +1325,7 @@ class App {
     output.className = "plan-summary";
     output.innerHTML = this.simple
       ? `Buy up to <strong>${plan.units.toLocaleString("en-GB")}</strong> ${unitsLabel} at about <strong>${this.money(entry)}</strong>. If it falls to <strong>${this.money(stop)}</strong>, get out — you'd lose about <strong>${this.money(risk)}</strong>. Aim to sell at <strong>${this.money(plan.target)}</strong> or better, so a win pays about <strong>${this.money(risk * reward)}</strong>.`
-      : `<strong>${plan.units.toLocaleString("en-GB")}</strong> ${unitsLabel} · risk/unit <strong>${this.money(plan.riskPerUnit)}</strong> · target <strong>${this.money(plan.target)}</strong> (${reward}R = ${this.money(risk * reward)}).`;
+      : `Position size at your risk: <strong>${plan.units.toLocaleString("en-GB")}</strong> ${unitsLabel}. Plan levels: entry <strong>${this.money(entry)}</strong> · stop <strong>${this.money(stop)}</strong> · target <strong>${this.money(plan.target)}</strong> (${reward}R = ${this.money(risk * reward)}).`;
   }
 
   private savePlan(event: SubmitEvent) {
@@ -1400,8 +1366,12 @@ class App {
   }
 
   private money(value: number) {
-    const maximumFractionDigits = Math.abs(value) < 1 ? 4 : 2;
-    return new Intl.NumberFormat("en-GB", { style: "currency", currency: "USD", maximumFractionDigits }).format(value);
+    // Significant digits for sub-dollar prices so micro-cap coins such as
+    // PEPE never round to US$0.00.
+    if (value !== 0 && Math.abs(value) < 1) {
+      return new Intl.NumberFormat("en-GB", { style: "currency", currency: "USD", maximumSignificantDigits: 4 }).format(value);
+    }
+    return new Intl.NumberFormat("en-GB", { style: "currency", currency: "USD", maximumFractionDigits: 2 }).format(value);
   }
 
   private inputPrice(value: number) {
